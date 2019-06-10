@@ -34,6 +34,8 @@
 #define STDOUT  1
 #define STDERR  2
 
+#define BACKLOG 5 // 可以粗略理解为套接字排队的最大连接数，为完成和已完成之和
+
 void accept_request(void *);
 void bad_request(int);
 void cat(int, FILE *);
@@ -67,8 +69,10 @@ void accept_request(void *arg)
     char *query_string = NULL;
 
     numchars = get_line(client, buf, sizeof(buf));
+    printf("buf:%s\n", buf);
     i = 0; j = 0;
-    while (!ISspace(buf[i]) && (i < sizeof(method) - 1))
+    int min_len = (sizeof(method) - 1) < (strlen(buf)-1)? (sizeof(method) - 1):(strlen(buf)-1);
+    while (!ISspace(buf[i]) && (i < min_len))
     {
         method[i] = buf[i];
         i++;
@@ -76,6 +80,7 @@ void accept_request(void *arg)
     j=i;
     method[i] = '\0';
 
+    printf("method:%s\n", method);
     if (strcasecmp(method, "GET") && strcasecmp(method, "POST"))
     {
         unimplemented(client);
@@ -108,7 +113,8 @@ void accept_request(void *arg)
         }
     }
 
-    sprintf(path, "htdocs%s", url);
+    sprintf(path, "/root/Tinyhttpd-master/htdocs%s", url);
+    printf("path:%s\n", path);
     if (path[strlen(path) - 1] == '/')
         strcat(path, "index.html");
     if (stat(path, &st) == -1) {
@@ -219,7 +225,7 @@ void execute_cgi(int client, const char *path,
     char c;
     int numchars = 1;
     int content_length = -1;
-
+printf("开始执行cgi\n");
     buf[0] = 'A'; buf[1] = '\0';
     if (strcasecmp(method, "GET") == 0)
         while ((numchars > 0) && strcmp("\n", buf))  /* read & discard headers */
@@ -259,16 +265,22 @@ void execute_cgi(int client, const char *path,
     }
     sprintf(buf, "HTTP/1.0 200 OK\r\n");
     send(client, buf, strlen(buf), 0);
+    // 数据流向
+    // cgi_input[1]->
+    // (cgi_input[0],STDIN)->
+    // (STDOUT,cgi_output[1])
+    // ->cgi_output[0]
+
     if (pid == 0)  /* child: CGI script */
     {
+        printf("开始执行child\n");
         char meth_env[255];
         char query_env[255];
         char length_env[255];
-
         dup2(cgi_output[1], STDOUT);
         dup2(cgi_input[0], STDIN);
-        close(cgi_output[0]);
-        close(cgi_input[1]);
+        close(cgi_output[0]);   //关闭输出
+        close(cgi_input[1]);    //关闭输入
         sprintf(meth_env, "REQUEST_METHOD=%s", method);
         putenv(meth_env);
         if (strcasecmp(method, "GET") == 0) {
@@ -279,11 +291,14 @@ void execute_cgi(int client, const char *path,
             sprintf(length_env, "CONTENT_LENGTH=%d", content_length);
             putenv(length_env);
         }
-        execl(path, NULL);
+        if(0 > execl(path, NULL))
+            printf("执行%s失败\n", path);
+        printf("执行结束\n");
         exit(0);
     } else {    /* parent */
-        close(cgi_output[1]);
-        close(cgi_input[0]);
+        printf("开始执行parent\n");
+        close(cgi_output[1]);   //关闭输出
+        close(cgi_input[0]);    //关闭输入
         if (strcasecmp(method, "POST") == 0)
             for (i = 0; i < content_length; i++) {
                 recv(client, &c, 1, 0);
@@ -296,6 +311,8 @@ void execute_cgi(int client, const char *path,
         close(cgi_input[1]);
         waitpid(pid, &status, 0);
     }
+
+    printf("end %d\n",getpid());
 }
 
 /**********************************************************************/
@@ -354,6 +371,7 @@ void headers(int client, const char *filename)
     (void)filename;  /* could use filename to determine file type */
 
     strcpy(buf, "HTTP/1.0 200 OK\r\n");
+    // send最后一个参数为0时，与write函数相同
     send(client, buf, strlen(buf), 0);
     strcpy(buf, SERVER_STRING);
     send(client, buf, strlen(buf), 0);
@@ -430,29 +448,43 @@ int startup(u_short *port)
 {
     int httpd = 0;
     int on = 1;
-    struct sockaddr_in name;
+    struct sockaddr_in server_socket;
 
+    // 由于历史原因，AF_INET和PF_INET可以看作是同等的参数，都代表IPv4
+    // AF_XXX表示地址族，PF_XXX表示协议族，
+    // SOCK_STREAM流式套接字 是指TCP|SCTP
+    // 在IPv4中，PF_INET对应一个特定的SOCK_STREAM，即TCP，所以第三个参数仅能设置为0
+    // socket 返回一个套接字描述符，与文件描述符相似
     httpd = socket(PF_INET, SOCK_STREAM, 0);
     if (httpd == -1)
         error_die("socket");
-    memset(&name, 0, sizeof(name));
-    name.sin_family = AF_INET;
-    name.sin_port = htons(*port);
-    name.sin_addr.s_addr = htonl(INADDR_ANY);
+    memset(&server_socket, 0, sizeof(server_socket));
+    server_socket.sin_family = AF_INET;
+    server_socket.sin_port = htons(*port);
+    server_socket.sin_addr.s_addr = htonl(INADDR_ANY);// 通配地址，会有内核选择具体的IP地址
+
+    // 允许重用本地地址
+    // on这个参数，在SO_REUSEADDR，可以看做是一个boolean值，非0代表启用，0代表禁用
+    // 如果设置为0，第二次启动时，很容易报错 Address already in use， 因为连接还没有断开
     if ((setsockopt(httpd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0)
     {
         error_die("setsockopt failed");
     }
-    if (bind(httpd, (struct sockaddr *)&name, sizeof(name)) < 0)
+
+    if (bind(httpd, (struct sockaddr *)&server_socket, sizeof(server_socket)) < 0)
         error_die("bind");
     if (*port == 0)  /* if dynamically allocating a port */
     {
-        socklen_t namelen = sizeof(name);
-        if (getsockname(httpd, (struct sockaddr *)&name, &namelen) == -1)
+        socklen_t namelen = sizeof(server_socket);
+        // 获取一个套接字的名字，我认为这里应该是套接字的信息，这个信息是在绑定之后产生的
+        // 如果制定了端口，这个信息和绑定之前是没有变化的
+        // 但如果没有，那么就会自动分配一个端口，这个时候就用到这个函数了。
+        if (getsockname(httpd, (struct sockaddr *)&server_socket, &namelen) == -1)
             error_die("getsockname");
-        *port = ntohs(name.sin_port);
+        *port = ntohs(server_socket.sin_port);
     }
-    if (listen(httpd, 5) < 0)
+    // listen函数只有TCP服务器调用才有效
+    if (listen(httpd, BACKLOG) < 0)
         error_die("listen");
     return(httpd);
 }
@@ -485,7 +517,7 @@ void unimplemented(int client)
 }
 
 /**********************************************************************/
-
+// 这程序对chrome内核支持良好，IE则运行异常，运行一次就奔溃
 int main(void)
 {
     int server_sock = -1;
